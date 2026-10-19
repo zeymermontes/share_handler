@@ -1,13 +1,10 @@
 package com.shoutsocial.share_handler
 
-import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
 import android.graphics.BitmapFactory
 import android.net.Uri
-import android.provider.OpenableColumns
 import android.util.Log
-import android.webkit.MimeTypeMap
 
 import androidx.annotation.NonNull
 import androidx.core.app.Person
@@ -21,10 +18,6 @@ import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
 import io.flutter.plugin.common.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.io.File
-import java.io.FileInputStream
-import java.io.FileOutputStream
-import java.net.URLConnection
 
 private const val kEventsChannel = "com.shoutsocial.share_handler/sharedMediaStream"
 
@@ -166,6 +159,9 @@ class ShareHandlerPlugin : FlutterPlugin, Messages.ShareHandlerApi, EventChannel
   }
 
   private fun handleIntent(intent: Intent, initial: Boolean) {
+    if (intent.action == Intent.ACTION_SEND || intent.action == Intent.ACTION_SEND_MULTIPLE) {
+      FileDirectory.pruneInbox(applicationContext)
+    }
     val attachments: List<Messages.SharedAttachment>? = try {
       attachmentsFromIntent(intent)
     } catch (e: Exception) {
@@ -231,95 +227,21 @@ class ShareHandlerPlugin : FlutterPlugin, Messages.ShareHandlerApi, EventChannel
   }
 
   private fun attachmentForUri(uri: Uri): Messages.SharedAttachment? {
-    val contentResolver = applicationContext.contentResolver
-
-    // Obtain the MIME type of the URI
-    val mimeType = contentResolver.getType(uri)
-
-    // Get the absolute path from the URI
-    val path = FileDirectory.getAbsolutePath(applicationContext, uri) ?: return null
-
-    val file = File(path)
-
-    // Check if the file name has an extension
-    if (file.extension.isNotEmpty()) {
-      // File has an extension; use it directly
-      val type = getAttachmentType(mimeType)
-      return Messages.SharedAttachment.Builder()
-        .setPath(file.absolutePath)
-        .setType(type)
-        .build()
-    } else {
-      // File does not have an extension; copy it to cache with the correct extension
-
-      // Obtain the file name from the URI, including extension
-      val fileName = getFileNameFromUri(contentResolver, uri, mimeType) ?: return null
-
-      // Create a new file in the cache directory with the correct file name
-      val newFile = File(applicationContext.cacheDir, fileName)
-
-      // Copy the contents from the URI to the new file
-      val success = copyFile(contentResolver, uri, newFile)
-      if (!success) {
-        return null
-      }
-
-      // Determine the attachment type using the MIME type
-      val type = getAttachmentType(mimeType)
-
-      // Return the attachment with the path to the copied file
-      return Messages.SharedAttachment.Builder()
-        .setPath(newFile.absolutePath)
-        .setType(type)
-        .build()
-    }
-  }
-
-  // Function to get the file name from the URI
-  private fun getFileNameFromUri(contentResolver: ContentResolver, uri: Uri, mimeType: String?): String? {
-    var fileName: String? = null
-    val cursor = contentResolver.query(uri, null, null, null, null)
-    cursor?.use { c ->
-      if (c.moveToFirst()) {
-        val nameIndex = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-        if (nameIndex != -1) {
-          fileName = c.getString(nameIndex)
-        }
-      }
-    }
-
-    // If the file name couldn't be obtained, generate one
-    if (fileName == null) {
-      fileName = "file_${System.currentTimeMillis()}"
-      // Add extension if possible
-      mimeType?.let {
-        val extension = MimeTypeMap.getSingleton().getExtensionFromMimeType(it)
-        if (extension != null) {
-          fileName += ".$extension"
-        }
-      }
-    }
-
-    return fileName
-  }
-
-  // Function to copy the file content from the URI to the destination file
-  private fun copyFile(contentResolver: ContentResolver, uri: Uri, destinationFile: File): Boolean {
-    return try {
-      contentResolver.openInputStream(uri)?.use { inputStream ->
-        FileOutputStream(destinationFile).use { outputStream ->
-          val buffer = ByteArray(8 * 1024) // 8KB buffer
-          var bytesRead: Int
-          while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-            outputStream.write(buffer, 0, bytesRead)
-          }
-        }
-      }
-      true
+    // MIME type as the sending app reports it; it only picks the attachment
+    // type and the extension of the copy.
+    val mimeType = try {
+      applicationContext.contentResolver.getType(uri)
     } catch (e: Exception) {
-      e.printStackTrace()
-      false
+      null
     }
+
+    // Always a copy inside cacheDir/share_in.
+    val file = FileDirectory.importToInbox(applicationContext, uri, mimeType) ?: return null
+
+    return Messages.SharedAttachment.Builder()
+      .setPath(file.absolutePath)
+      .setType(getAttachmentType(mimeType))
+      .build()
   }
 
   // Function to determine the attachment type using the MIME type

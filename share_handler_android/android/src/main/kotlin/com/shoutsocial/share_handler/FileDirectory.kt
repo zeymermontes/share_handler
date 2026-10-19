@@ -1,172 +1,110 @@
 package com.shoutsocial.share_handler
 
-import android.content.ContentUris
+import android.content.ContentResolver
 import android.content.Context
-import android.database.Cursor
 import android.net.Uri
-import android.os.Build
-import android.provider.DocumentsContract
-import android.provider.MediaStore
+import android.provider.OpenableColumns
+import android.util.Log
+import android.webkit.MimeTypeMap
 import java.io.File
 import java.io.FileOutputStream
-import java.util.*
-import android.webkit.MimeTypeMap
-import android.util.Log
+import java.util.UUID
 
-
+/**
+ * Copies a shared URI into the app's share inbox ([ShareInbox]).
+ *
+ * Only `content://` URIs served by another app's provider are accepted, and
+ * their content is always copied into the inbox; other schemes and this
+ * app's own providers are ignored. The provider's display name is used as
+ * metadata only (see [ShareInbox.targetFor]).
+ */
 object FileDirectory {
+    private const val TAG = "ShareHandler"
+    private const val INBOX_MAX_AGE_MS = 24L * 60 * 60 * 1000
 
-    /**
-     * Get a file path from a Uri. This will get the the path for Storage Access
-     * Framework Documents, as well as the _data field for the MediaStore and
-     * other file-based ContentProviders.
-     *
-     * @param context The context.
-     * @param uri The Uri to query.
-     * @author paulburke
-     */
-    fun getAbsolutePath(context: Context, uri: Uri): String? {
+    fun inboxDir(context: Context): File = File(context.cacheDir, ShareInbox.DIR_NAME)
 
-        // DocumentProvider
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT && DocumentsContract.isDocumentUri(context, uri)) {
-            // ExternalStorageProvider
-            if (isExternalStorageDocument(uri)) {
-                val docId = DocumentsContract.getDocumentId(uri)
-                val split = docId.split(":".toRegex()).dropLastWhile { it.isEmpty() }.toTypedArray()
-                val type = split[0]
-
-                return if ("primary".equals(type, ignoreCase = true)) {
-                    context.getExternalFilesDir(null).toString() + "/" + split[1]
-                } else {
-                    getDataColumn(context, uri, null, null)
-                }
-            } else if (isDownloadsDocument(uri)) {
-                return try {
-                    val id = DocumentsContract.getDocumentId(uri)
-                    val contentUri = ContentUris.withAppendedId(
-                        Uri.parse("content://downloads/public_downloads"), java.lang.Long.valueOf(id))
-
-                    getDataColumn(context, contentUri, null, null)
-                } catch (exception: Exception) {
-                    getDataColumn(context, uri, null, null)
-                }
-            } else if (isMediaDocument(uri)) {
-                val docId = DocumentsContract.getDocumentId(uri)
-                val split = docId.split(":".toRegex()).dropLastWhile { it.isEmpty() }.toTypedArray()
-                val type = split[0]
-
-                var contentUri: Uri? = null
-                when (type) {
-                    "image" -> contentUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-                    "video" -> contentUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-                    "audio" -> contentUri = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
-                }
-
-                if (contentUri == null) return null
-
-                val selection = "_id=?"
-                val selectionArgs = arrayOf(split[1])
-                return getDataColumn(context, contentUri, selection, selectionArgs)
-            }// MediaProvider
-            // DownloadsProvider
-        } else if ("content".equals(uri.scheme, ignoreCase = true)) {
-            return getDataColumn(context, uri, null, null)
-        }
-
-        return uri.path
-    }
-
-    /**
-     * Get the value of the data column for this Uri. This is useful for
-     * MediaStore Uris, and other file-based ContentProviders.
-     *
-     * @param context The context.
-     * @param uri The Uri to query.
-     * @param selection (Optional) Filter used in the query.
-     * @param selectionArgs (Optional) Selection arguments used in the query.
-     * @return The value of the _data column, which is typically a file path.
-     */
-    private fun getDataColumn(context: Context, uri: Uri, selection: String?,
-                              selectionArgs: Array<String>?): String? {
-
-        if (uri.authority != null && selection==null) {
-            var cursor: Cursor? = null
-            val column = "_display_name"
-            val projection = arrayOf(column)
-            var targetFile: File? = null
-            try {
-                cursor = context.contentResolver.query(uri, projection, selection, selectionArgs, null)
-                if (cursor != null && cursor.moveToFirst()) {
-                    val columnIndex = cursor.getColumnIndexOrThrow(column)
-                    val fileName: String? = cursor.getString(columnIndex)
-                    Log.i("FileDirectory", "File name: $fileName")
-                    if (!fileName.isNullOrBlank()) {
-                        targetFile = File(context.cacheDir, fileName)
-                    }
-                }
-            } finally {
-                cursor?.close()
-            }
-
-            if (targetFile == null) {
-                val mimeType = context.contentResolver.getType(uri)
-                val prefix = with(mimeType ?: "") {
-                    when {
-                        startsWith("image") -> "IMG"
-                        startsWith("video") -> "VID"
-                        else -> "FILE"
-                    }
-                }
-                val type = MimeTypeMap.getSingleton().getExtensionFromMimeType(mimeType)
-                targetFile = File(context.cacheDir, "${prefix}_${Date().time}.$type")
-            }
-            val uri = selectionArgs?.let { args -> uri.buildUpon().appendPath(args.first()).build() } ?: uri
-            context.contentResolver.openInputStream(uri)?.use { input ->
-                FileOutputStream(targetFile).use { fileOut ->
-                    input.copyTo(fileOut)
-                }
-            }
-            return targetFile.path
-        }
-
-        var cursor: Cursor? = null
-        val column = "_data"
-        val projection = arrayOf(column)
-
+    /** Deletes inbox entries left over from shares older than a day. */
+    fun pruneInbox(context: Context) {
         try {
-            cursor = context.contentResolver.query(uri, projection, selection, selectionArgs, null)
-            if (cursor != null && cursor.moveToFirst()) {
-                val columnIndex = cursor.getColumnIndexOrThrow(column)
-                return cursor.getString(columnIndex)
-            }
-        } finally {
-            cursor?.close()
+            ShareInbox.prune(inboxDir(context), System.currentTimeMillis(), INBOX_MAX_AGE_MS)
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not prune share inbox", e)
         }
-        return null
     }
 
-
-    /**
-     * @param uri The Uri to check.
-     * @return Whether the Uri authority is ExternalStorageProvider.
-     */
-    private fun isExternalStorageDocument(uri: Uri): Boolean {
-        return "com.android.externalstorage.documents" == uri.authority
+    /** Whether [uri] may be read as a share: `content://` from another app's provider. */
+    fun isAcceptedUri(context: Context, uri: Uri): Boolean {
+        if (!ContentResolver.SCHEME_CONTENT.equals(uri.scheme, ignoreCase = true)) return false
+        val authority = uri.authority
+        if (authority.isNullOrEmpty()) return false
+        val ownPackage = context.packageName
+        // Authorities are a single string or a ';'-separated list.
+        if (authority.split(';').any { it == ownPackage || it.startsWith("$ownPackage.") }) {
+            return false
+        }
+        val provider = try {
+            context.packageManager.resolveContentProvider(authority, 0)
+        } catch (e: Exception) {
+            null
+        }
+        if (provider != null && provider.packageName == ownPackage) return false
+        return true
     }
 
     /**
-     * @param uri The Uri to check.
-     * @return Whether the Uri authority is DownloadsProvider.
+     * Copies [uri] into a fresh inbox directory and returns the file, or null
+     * when the URI is not accepted or cannot be read.
      */
-    private fun isDownloadsDocument(uri: Uri): Boolean {
-        return "com.android.providers.downloads.documents" == uri.authority
+    fun importToInbox(context: Context, uri: Uri, mimeType: String?): File? {
+        if (!isAcceptedUri(context, uri)) {
+            Log.w(TAG, "Rejected shared URI (scheme or authority not allowed)")
+            return null
+        }
+        val resolver = context.contentResolver
+        val displayName = queryDisplayName(resolver, uri)
+        val mimeExtension = mimeType?.let { MimeTypeMap.getSingleton().getExtensionFromMimeType(it) }
+
+        val inbox = inboxDir(context)
+        val target = try {
+            ShareInbox.targetFor(inbox, UUID.randomUUID().toString(), displayName, mimeExtension)
+        } catch (e: Exception) {
+            Log.w(TAG, "Rejected shared item destination", e)
+            return null
+        }
+        val itemDir = target.parentFile ?: return null
+        return try {
+            if (!itemDir.mkdirs() && !itemDir.isDirectory) return null
+            ShareInbox.requireInside(inbox, itemDir)
+            val copied = resolver.openInputStream(uri)?.use { input ->
+                FileOutputStream(target).use { output -> input.copyTo(output) }
+                true
+            } ?: false
+            if (!copied) {
+                itemDir.deleteRecursively()
+                return null
+            }
+            ShareInbox.requireInside(inbox, target)
+            target
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not copy shared item", e)
+            itemDir.deleteRecursively()
+            null
+        }
     }
 
-    /**
-     * @param uri The Uri to check.
-     * @return Whether the Uri authority is MediaProvider.
-     */
-    private fun isMediaDocument(uri: Uri): Boolean {
-        return "com.android.providers.media.documents" == uri.authority
+    private fun queryDisplayName(resolver: ContentResolver, uri: Uri): String? {
+        return try {
+            resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                if (c.moveToFirst()) {
+                    val index = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (index != -1) c.getString(index) else null
+                } else {
+                    null
+                }
+            }
+        } catch (e: Exception) {
+            null
+        }
     }
 }
